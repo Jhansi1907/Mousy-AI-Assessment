@@ -1,0 +1,16 @@
+@'
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+**/build/
+**/.dart_tool/
+**/.gradle/
+**/local.properties
+*.jks
+*.keystore
+**/__pycache__/
+**/.venv/
+'@ | Set-Content .gitignore

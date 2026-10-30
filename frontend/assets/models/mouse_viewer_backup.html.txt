@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1.0">
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #F5F0FF;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+</head>
+<body>
+<script type="module">
+  import * as THREE from
+    'https://esm.sh/three@0.160.1';
+
+  import { GLTFLoader } from
+    'https://esm.sh/three@0.160.1/examples/jsm/loaders/GLTFLoader.js';
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color('#F5F0FF');
+
+  const camera = new THREE.PerspectiveCamera(
+    35,
+    window.innerWidth / window.innerHeight,
+    0.01,
+    100
+  );
+
+  const renderer = new THREE.WebGLRenderer({
+    antialias: true,
+    alpha: true
+  });
+
+  renderer.setSize(
+    window.innerWidth,
+    window.innerHeight
+  );
+
+  renderer.setPixelRatio(
+    Math.min(window.devicePixelRatio || 1, 2)
+  );
+
+  document.body.appendChild(renderer.domElement);
+
+  scene.add(
+    new THREE.HemisphereLight(0xffffff, 0x777777, 3)
+  );
+
+  const light = new THREE.DirectionalLight(0xffffff, 2);
+  light.position.set(3, 5, 4);
+  scene.add(light);
+
+  let mixer = null;
+  let mouthAction = null;
+  let leftHandAction = null;
+  let rightHandAction = null;
+  let eyeAction = null;
+
+  let isSpeaking = false;
+  let gestureTimer = null;
+
+  // Mouth moves only when Flutter TTS is speaking.
+  window.setSpeaking = (speaking) => {
+    isSpeaking = Boolean(speaking);
+
+    if (!mouthAction) return;
+
+    if (isSpeaking) {
+      mouthAction.reset();
+      mouthAction.enabled = true;
+      mouthAction.paused = false;
+      mouthAction.setEffectiveWeight(1);
+      mouthAction.setEffectiveTimeScale(2.5);
+      mouthAction.setLoop(
+        THREE.LoopRepeat,
+        Infinity
+      );
+      mouthAction.play();
+    } else {
+      mouthAction.stop();
+    }
+  };
+
+  // Play one hand movement, then stop.
+  function playHandGesture(action) {
+    if (!action || action.isRunning()) return;
+
+    action.reset();
+    action.enabled = true;
+    action.paused = false;
+    action.setEffectiveWeight(1);
+    action.setEffectiveTimeScale(1);
+    action.clampWhenFinished = false;
+    action.setLoop(THREE.LoopOnce, 1);
+    action.play();
+  }
+
+  // Random hand gestures every 3–7 seconds.
+  function scheduleHandGesture() {
+    const delay = 3000 + Math.random() * 4000;
+
+    gestureTimer = setTimeout(() => {
+      const selectedHand = Math.random() < 0.5
+        ? leftHandAction
+        : rightHandAction;
+
+      playHandGesture(selectedHand);
+      scheduleHandGesture();
+    }, delay);
+  }
+
+  const loader = new GLTFLoader();
+
+  loader.load(
+    'Cute_Mouse_Animated.glb',
+
+    (gltf) => {
+      const mouse = gltf.scene;
+      scene.add(mouse);
+
+      const box = new THREE.Box3().setFromObject(mouse);
+      const center = box.getCenter(new THREE.Vector3());
+      const size = box.getSize(new THREE.Vector3());
+
+      const maxDimension = Math.max(
+        size.x, size.y, size.z
+      );
+
+      const scale = maxDimension > 0
+        ? 2.0 / maxDimension
+        : 1;
+
+      mouse.scale.setScalar(scale);
+      mouse.position.copy(center).multiplyScalar(-scale);
+
+      camera.position.set(0, 0, 6);
+      camera.lookAt(0, 0, 0);
+
+      mixer = new THREE.AnimationMixer(mouse);
+
+      gltf.animations.forEach((clip, index) => {
+        const action = mixer.clipAction(clip);
+        const name = clip.name.trim();
+
+        const number = ['1', '2', '3', '4'].includes(name)
+          ? Number(name)
+          : index + 1;
+
+        // 1 = EYES
+        if (number === 1) {
+          eyeAction = action;
+          eyeAction.setLoop(
+            THREE.LoopRepeat,
+            Infinity
+          );
+          eyeAction.play();
+
+        // 2 = MOUTH
+        } else if (number === 2) {
+          mouthAction = action;
+          mouthAction.setLoop(
+            THREE.LoopRepeat,
+            Infinity
+          );
+
+        // 3 = LEFT HAND
+        } else if (number === 3) {
+          leftHandAction = action;
+
+        // 4 = RIGHT HAND
+        } else if (number === 4) {
+          rightHandAction = action;
+        }
+      });
+
+      // Do not move mouth when AI is silent.
+      if (isSpeaking) {
+        window.setSpeaking(true);
+      }
+
+      // Hands move occasionally.
+      scheduleHandGesture();
+
+      window.FlutterViewer?.postMessage(
+        'Loaded animations: ' +
+        gltf.animations.map(
+          (a, i) => `${i + 1}:${a.name}`
+        ).join(', ')
+      );
+    },
+
+    undefined,
+
+    (error) => {
+      window.FlutterViewer?.postMessage(
+        'Model loading error: ' +
+        (error.message || String(error))
+      );
+    }
+  );
+
+  const clock = new THREE.Clock();
+
+  function animate() {
+    requestAnimationFrame(animate);
+
+    const delta = clock.getDelta();
+
+    if (mixer) {
+      mixer.update(delta);
+    }
+
+    renderer.render(scene, camera);
+  }
+
+  animate();
+
+  window.addEventListener('resize', () => {
+    camera.aspect =
+      window.innerWidth / window.innerHeight;
+
+    camera.updateProjectionMatrix();
+
+    renderer.setSize(
+      window.innerWidth,
+      window.innerHeight
+    );
+  });
+</script>
+</body>
+</html>

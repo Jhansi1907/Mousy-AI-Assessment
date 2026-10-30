@@ -1,0 +1,620 @@
+import 'dart:convert';
+import 'dart:math' as math;
+import 'dart:typed_data';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_tts/flutter_tts.dart';
+import 'package:http/http.dart' as http;
+import 'package:speech_to_text/speech_to_text.dart' as stt;
+import 'package:webview_flutter/webview_flutter.dart';
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const TalkingCompanionApp());
+}
+
+class TalkingCompanionApp extends StatelessWidget {
+  const TalkingCompanionApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'AI Talking Companion',
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.deepPurple,
+        ),
+        useMaterial3: true,
+      ),
+      home: const CompanionHomePage(),
+    );
+  }
+}
+
+class CompanionHomePage extends StatefulWidget {
+  const CompanionHomePage({super.key});
+
+  @override
+  State<CompanionHomePage> createState() =>
+      _CompanionHomePageState();
+}
+
+class _CompanionHomePageState extends State<CompanionHomePage> {
+  final stt.SpeechToText _speech = stt.SpeechToText();
+  final FlutterTts _flutterTts = FlutterTts();
+
+  // Your laptop's local Wi-Fi IP address
+  static const String backendUrl = 'http://192.168.0.8:8000';
+
+  late final WebViewController _webController;
+
+  bool _viewerReady = false;
+  String _viewerMessage = 'Loading 3D mouse...';
+
+  bool isListening = false;
+  bool isLoading = false;
+  bool isSpeaking = false;
+  bool _requestSent = false;
+
+  String recognizedText = '';
+  String aiReply = '';
+  String statusText = 'Tap the microphone to start';
+
+  @override
+  void initState() {
+    super.initState();
+    initializeViewer();
+    initializeTts();
+  }
+
+  Future<void> initializeViewer() async {
+    _webController = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setBackgroundColor(const Color(0xFFF5F0FF))
+      ..addJavaScriptChannel(
+        'FlutterViewer',
+        onMessageReceived: (message) {
+          if (!mounted) return;
+
+          final ready =
+              message.message.startsWith('Loaded animations:');
+
+          setState(() {
+            _viewerMessage = message.message;
+            _viewerReady = ready;
+          });
+
+          if (ready) {
+            updateMouthAnimation();
+          }
+        },
+      );
+
+    try {
+      // Read the HTML file from Flutter assets.
+      final html = await rootBundle.loadString(
+        'assets/models/mouse_viewer.html',
+      );
+
+      // Read the GLB directly from Flutter assets.
+      final ByteData modelData = await rootBundle.load(
+        'assets/models/Cute_Mouse_Animated.glb',
+      );
+
+      // Convert GLB bytes into Base64.
+      final modelBytes = modelData.buffer.asUint8List(
+        modelData.offsetInBytes,
+        modelData.lengthInBytes,
+      );
+
+      final modelBase64 = base64Encode(modelBytes);
+
+      // Replace the model URL in HTML with embedded model data.
+      final updatedHtml = html.replaceFirst(
+        "'Cute_Mouse_Animated.glb'",
+        "'data:model/gltf-binary;base64,$modelBase64'",
+      );
+
+      if (!mounted) return;
+
+      // Load HTML with the embedded 3D model.
+      await _webController.loadHtmlString(updatedHtml);
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        _viewerMessage = '3D viewer error: $e';
+      });
+    }
+  }
+
+  Future<void> updateMouthAnimation() async {
+    if (!_viewerReady) return;
+
+    try {
+      await _webController.runJavaScript(
+        'window.setSpeaking(${isSpeaking ? 'true' : 'false'});',
+      );
+    } catch (e) {
+      debugPrint('Mouth animation error: $e');
+    }
+  }
+
+  Future<void> initializeTts() async {
+    await _flutterTts.setLanguage('en-US');
+    await _flutterTts.setSpeechRate(0.5);
+    await _flutterTts.setPitch(1.0);
+    await _flutterTts.setVolume(1.0);
+
+    _flutterTts.setProgressHandler(
+  (String text, int start, int end, String word) {
+    if (!mounted || !isSpeaking || !_viewerReady) return;
+
+    _webController.runJavaScript(
+      'window.onSpokenWord(${jsonEncode(word)});',
+    );
+  },
+);
+
+    _flutterTts.setStartHandler(() {
+      if (!mounted) return;
+
+      setState(() {
+        isSpeaking = true;
+        statusText = 'AI Companion is speaking...';
+      });
+
+      updateMouthAnimation();
+    });
+
+    _flutterTts.setCompletionHandler(() {
+      if (!mounted) return;
+
+      setState(() {
+        isSpeaking = false;
+        statusText = 'Tap the microphone to start';
+      });
+
+      updateMouthAnimation();
+    });
+
+    _flutterTts.setCancelHandler(() {
+      if (!mounted) return;
+
+      setState(() {
+        isSpeaking = false;
+      });
+
+      updateMouthAnimation();
+    });
+
+    _flutterTts.setErrorHandler((message) {
+      if (!mounted) return;
+
+      setState(() {
+        isSpeaking = false;
+        statusText = 'Voice playback error: $message';
+      });
+
+      updateMouthAnimation();
+    });
+  }
+
+  Future<void> speakResponse(String reply) async {
+    if (reply.trim().isEmpty) return;
+
+    try {
+      await _flutterTts.stop();
+      await _flutterTts.speak(reply);
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        isSpeaking = false;
+        statusText = 'Unable to speak response: $e';
+      });
+
+      updateMouthAnimation();
+    }
+  }
+
+  Future<void> sendToBackend(String message) async {
+    if (message.trim().isEmpty || _requestSent) return;
+
+    _requestSent = true;
+
+    setState(() {
+      isLoading = true;
+      statusText = 'Thinking...';
+      aiReply = '';
+    });
+
+    try {
+      final response = await http
+          .post(
+            Uri.parse('$backendUrl/api/chat'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'message': message}),
+          )
+          .timeout(const Duration(seconds: 20));
+
+      if (!mounted) return;
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+
+        final String reply =
+            data['reply']?.toString() ?? 'No reply received';
+
+        setState(() {
+          aiReply = reply;
+          statusText = 'Response received';
+        });
+
+        await speakResponse(reply);
+      } else {
+        setState(() {
+          statusText = 'Backend error: ${response.statusCode}';
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        statusText = 'Cannot connect to backend: $e';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          isLoading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> startListening() async {
+    if (isLoading || isListening) return;
+
+    try {
+      await _flutterTts.stop();
+
+      if (!mounted) return;
+
+      setState(() {
+        isSpeaking = false;
+      });
+
+      updateMouthAnimation();
+
+      final available = await _speech.initialize(
+        onStatus: (status) {
+          if (!mounted) return;
+
+          if (status == 'done' || status == 'notListening') {
+            setState(() {
+              isListening = false;
+            });
+
+            if (recognizedText.trim().isNotEmpty &&
+                !_requestSent) {
+              sendToBackend(recognizedText);
+            }
+          }
+        },
+        onError: (error) {
+          if (!mounted) return;
+
+          setState(() {
+            isListening = false;
+            statusText = 'Speech error: ${error.errorMsg}';
+          });
+        },
+      );
+
+      if (!mounted) return;
+
+      if (!available) {
+        setState(() {
+          statusText = 'Speech recognition is unavailable';
+        });
+        return;
+      }
+
+      _requestSent = false;
+
+      setState(() {
+        isListening = true;
+        recognizedText = '';
+        aiReply = '';
+        statusText = 'Listening...';
+      });
+
+      await _speech.listen(
+        onResult: (result) {
+          if (!mounted) return;
+
+          setState(() {
+            recognizedText = result.recognizedWords;
+          });
+
+          if (result.finalResult && !_requestSent) {
+            setState(() {
+              isListening = false;
+            });
+
+            sendToBackend(result.recognizedWords);
+          }
+        },
+        listenFor: const Duration(seconds: 30),
+        pauseFor: const Duration(seconds: 3),
+        localeId: 'en_US',
+      );
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        isListening = false;
+        statusText = 'Unable to start microphone: $e';
+      });
+    }
+  }
+
+  Future<void> stopListening() async {
+    await _speech.stop();
+
+    if (!mounted) return;
+
+    setState(() {
+      isListening = false;
+    });
+
+    if (recognizedText.trim().isNotEmpty && !_requestSent) {
+      await sendToBackend(recognizedText);
+    } else if (recognizedText.trim().isEmpty) {
+      setState(() {
+        statusText = 'No speech detected. Please try again.';
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _speech.cancel();
+    _flutterTts.stop();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFFF5F0FF),
+      appBar: AppBar(
+        title: const Text('AI Talking Companion'),
+        centerTitle: true,
+        backgroundColor: Colors.deepPurple,
+        foregroundColor: Colors.white,
+      ),
+      body: SafeArea(
+        child: Column(
+          children: [
+            const SizedBox(height: 12),
+
+            // Three.js 3D mouse viewer
+            SizedBox(
+              height: 260,
+              width: double.infinity,
+              child: Stack(
+                children: [
+                  WebViewWidget(controller: _webController),
+
+                  if (!_viewerReady)
+                    Positioned(
+                      bottom: 4,
+                      left: 8,
+                      right: 8,
+                      child: Text(
+                        _viewerMessage,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          fontSize: 11,
+                          color: Colors.deepPurple,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+
+            const SizedBox(height: 10),
+
+            // Animated sound waves
+            AudioWaveform(
+              active: isListening || isSpeaking,
+            ),
+
+            const SizedBox(height: 12),
+
+            const Text(
+              'Hello! I am your AI Companion',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: 21,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+
+            const SizedBox(height: 12),
+
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Text(
+                statusText,
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 16),
+              ),
+            ),
+
+            const SizedBox(height: 12),
+
+            Expanded(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(16),
+                child: Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(20),
+                    child: SizedBox(
+                      width: double.infinity,
+                      child: Column(
+                        children: [
+                          const Text(
+                            'You said:',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            recognizedText.isEmpty
+                                ? 'Your speech will appear here.'
+                                : recognizedText,
+                            textAlign: TextAlign.center,
+                          ),
+                          const SizedBox(height: 20),
+                          const Text(
+                            'AI Companion:',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            aiReply.isEmpty
+                                ? 'Waiting for a response...'
+                                : aiReply,
+                            textAlign: TextAlign.center,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+
+            if (isLoading)
+              const CircularProgressIndicator(),
+
+            const SizedBox(height: 12),
+
+            FloatingActionButton.large(
+              onPressed: isLoading
+                  ? null
+                  : () {
+                      if (isListening) {
+                        stopListening();
+                      } else {
+                        startListening();
+                      }
+                    },
+              backgroundColor: Colors.deepPurple,
+              foregroundColor: Colors.white,
+              child: Icon(
+                isListening ? Icons.stop : Icons.mic,
+                size: 35,
+              ),
+            ),
+
+            const SizedBox(height: 25),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// Animated blue waveform
+class AudioWaveform extends StatefulWidget {
+  final bool active;
+
+  const AudioWaveform({
+    super.key,
+    required this.active,
+  });
+
+  @override
+  State<AudioWaveform> createState() => _AudioWaveformState();
+}
+
+class _AudioWaveformState extends State<AudioWaveform>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 650),
+    );
+
+    if (widget.active) {
+      _controller.repeat(reverse: true);
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant AudioWaveform oldWidget) {
+    super.didUpdateWidget(oldWidget);
+
+    if (widget.active && !_controller.isAnimating) {
+      _controller.repeat(reverse: true);
+    } else if (!widget.active && _controller.isAnimating) {
+      _controller.stop();
+      _controller.reset();
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, child) {
+        return SizedBox(
+          height: 35,
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: List.generate(15, (index) {
+              final phase = index * 0.55;
+              final wave = math.sin(
+                _controller.value * math.pi * 2 + phase,
+              );
+
+              final height = widget.active
+                  ? 7.0 + 25.0 * ((wave + 1.0) / 2.0)
+                  : 5.0;
+
+              return Container(
+                width: 4,
+                height: height,
+                margin: const EdgeInsets.symmetric(horizontal: 2),
+                decoration: BoxDecoration(
+                  color: Colors.lightBlueAccent,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+              );
+            }),
+          ),
+        );
+      },
+    );
+  }
+}
